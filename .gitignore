@@ -3,3 +3,8 @@ venv/
 .vscode/
 .ipynb_checkpoints/
 .DS_Store
+
+# BTL project - large data files
+BTL/Article_Crawl/
+BTL/index.pkl
+# BTL/*.csv
