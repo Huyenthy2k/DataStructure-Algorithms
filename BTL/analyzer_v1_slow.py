@@ -1,11 +1,10 @@
 import os
 import json
 import pickle
-from collections import Counter, defaultdict, deque
+from collections import Counter, defaultdict
 from tqdm import tqdm
 import torch
 from transformers import pipeline, AutoTokenizer
-from concurrent.futures import ThreadPoolExecutor
 
 class IndexManager:
     def __init__(self):
@@ -64,42 +63,10 @@ class DataLoader:
         except Exception:
             return ""
 
-# Global queue to track which file each chunk belongs to.
-chunk_file_map = deque()
-
-def data_generator(loader, files, tokenizer, max_tokens=500):
-    """
-    Yields chunk text one by one.
-    Uses ThreadPoolExecutor to read files in parallel for IO bound speedup.
-    """
-    # 4 workers is usually enough for disk IO without thrashing
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        # executor.map guarantees results match input order
-        results = executor.map(loader.parse_file, files)
-        
-        for file_path, text in zip(files, results):
-            if not text:
-                continue
-            
-            # Tokenize (fast tokenizer)
-            tokenized = tokenizer(text, add_special_tokens=False)
-            input_ids = tokenized['input_ids']
-            
-            # Split into chunks
-            for i in range(0, len(input_ids), max_tokens):
-                chunk_ids = input_ids[i : i + max_tokens]
-                if not chunk_ids: continue
-                
-                chunk_text = tokenizer.decode(chunk_ids)
-                
-                # Record mapping BEFORE yielding so it stays in sync
-                chunk_file_map.append(file_path)
-                yield chunk_text
-
 def main():
     root_dir = "/Users/nguyensiry/Documents/Code_practice/Data_structure_algorithms/BTL/Article_Crawl"
     
-    print("Initializing Deep Learning Model (High Speed Mode)...")
+    print("Initializing Deep Learning Model...")
     device = -1
     if torch.cuda.is_available():
         device = 0
@@ -121,28 +88,45 @@ def main():
 
     loader = DataLoader(root_dir)
     files = loader.get_files()
-    print(f"Found {len(files)} files.")
+    print(f"Found {len(files)} files. Preparing chunks...")
+    
+    all_chunks = []
+    chunk_map = [] # stores file_path for each chunk
+    
+    # Token-based chunking
+    # We want max ~500 tokens. Leave room for special tokens.
+    MAX_TOKENS = 500
+    
+    for file_path in tqdm(files, desc="Chunking"):
+        text = loader.parse_file(file_path)
+        if not text:
+            continue
+        
+        # Tokenize (returns {'input_ids': [...]})
+        # Use fast tokenizer
+        tokenized = tokenizer(text, add_special_tokens=False)
+        input_ids = tokenized['input_ids']
+        
+        # Split into chunks of MAX_TOKENS
+        for i in range(0, len(input_ids), MAX_TOKENS):
+            chunk_ids = input_ids[i : i + MAX_TOKENS]
+            if not chunk_ids: continue
+            
+            # Decode back to string
+            chunk_text = tokenizer.decode(chunk_ids)
+            all_chunks.append(chunk_text)
+            chunk_map.append(file_path)
+            
+    print(f"Created {len(all_chunks)} chunks from {len(files)} files.")
     
     indexer = IndexManager()
     
-    print("Starting Streaming Deep Learning NER...")
-    print("  - Strategy: Parallel IO Reading -> Generator -> Batched GPU Inference")
-    print("  - Note: Progress bar shows *chunks processed*.")
+    print("Starting Deep Learning NER (Batched)...")
     
-    # Estimate total chunks for progress bar (avg ~2-3 chunks per file usually)
-    ESTIMATED_CHUNKS = len(files) * 2 
+    inference_iter = ner_pipe(all_chunks, batch_size=32)
     
-    # Pass the generator to the pipeline. Pipeline will consume it.
-    inference_iter = ner_pipe(data_generator(loader, files, tokenizer), batch_size=128)
-    
-    for result in tqdm(inference_iter, total=ESTIMATED_CHUNKS, desc="Streaming Inference"):
-        # Retrieve the file path for this chunk
-        try:
-            file_path = chunk_file_map.popleft()
-        except IndexError:
-            # Should not happen if pipeline yields 1 result per 1 input
-            print("Error: Chunk map out of sync!")
-            break
+    for params in tqdm(zip(chunk_map, inference_iter), total=len(all_chunks), desc="Inference"):
+        file_path, result = params
         
         # Extract entities from this chunk
         chunk_entities = []
